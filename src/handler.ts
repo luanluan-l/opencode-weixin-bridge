@@ -49,7 +49,7 @@ export interface OpenCodeConfig {
   password?: string;
 }
 
-const userSessions = new Map<string, string>();
+export const userSessions = new Map<string, string>();
 
 async function getOrCreateSession(userId: string, config: OpenCodeConfig): Promise<string> {
   const existing = userSessions.get(userId);
@@ -100,7 +100,6 @@ async function callOpenCode(
   }
 
   const data = await res.json() as Record<string, unknown>;
-  console.log(`[handler] OpenCode raw response: ${JSON.stringify(data).slice(0, 2000)}`);
 
   const parts = (data.parts ?? []) as Array<Record<string, unknown>>;
   const textParts: string[] = [];
@@ -108,12 +107,12 @@ async function callOpenCode(
     const pType = part.type as string;
     if (pType === "text" && part.text) {
       textParts.push(String(part.text));
-    } else {
-      console.log(`[handler] skipped part type=${pType} keys=${Object.keys(part).join(",")}`);
-      if (part.content) textParts.push(String(part.content));
-      if (part.output) textParts.push(String(part.output));
-      if (part.result) textParts.push(String(part.result));
-      if (part.text) textParts.push(String(part.text));
+    } else if (part.content) {
+      textParts.push(String(part.content));
+    } else if (part.output) {
+      textParts.push(String(part.output));
+    } else if (part.result) {
+      textParts.push(String(part.result));
     }
   }
 

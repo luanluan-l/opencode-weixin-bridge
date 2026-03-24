@@ -21,6 +21,14 @@ npm install
 
 ## Usage
 
+### List All Sessions
+
+List all OpenCode sessions:
+
+```bash
+npm run list-sessions
+```
+
 ### Login
 
 First, authenticate with WeChat by scanning a QR code:

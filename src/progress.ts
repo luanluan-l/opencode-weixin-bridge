@@ -39,6 +39,8 @@ export class ProgressMonitor {
   private sessionIdMap: Map<string, string> = new Map();
   private lastProgressTime: Map<string, number> = new Map();
   private readonly PROGRESS_THROTTLE_MS = 2000;
+  private sseReady: Promise<void> = Promise.resolve();
+  private sseReadyResolver?: () => void;
 
   constructor(private config: ProgressConfig) {}
 
@@ -58,48 +60,52 @@ export class ProgressMonitor {
 
     this.sessionIdMap.set(userId, sessionId);
 
-    const handler: ProgressHandler = {
-      sendProgress: async (text: string) => {
-        const now = Date.now();
-        const lastTime = this.lastProgressTime.get(userId) ?? 0;
-        
-        if (now - lastTime < this.PROGRESS_THROTTLE_MS && text.includes("...")) {
-          return;
-        }
-        
-        this.lastProgressTime.set(userId, now);
+      const handler: ProgressHandler = {
+        sendProgress: async (text: string) => {
+          const now = Date.now();
+          const lastTime = this.lastProgressTime.get(userId) ?? 0;
 
-        try {
-          await sendMessage({
-            baseUrl: creds.baseUrl,
-            token: creds.token,
-            body: {
-              msg: {
-                from_user_id: "",
-                to_user_id: userId,
-                client_id: `progress-${Date.now()}`,
-                message_type: MessageType.BOT,
-                message_state: MessageState.FINISH,
-                item_list: [{ type: MessageItemType.TEXT, text_item: { text: `⏳ ${text}` } }],
+          if (now - lastTime < this.PROGRESS_THROTTLE_MS) {
+            return;
+          }
+
+          this.lastProgressTime.set(userId, now);
+
+          try {
+            await sendMessage({
+              baseUrl: creds.baseUrl,
+              token: creds.token,
+              body: {
+                msg: {
+                  from_user_id: "",
+                  to_user_id: userId,
+                  client_id: `progress-${Date.now()}`,
+                  message_type: MessageType.BOT,
+                  message_state: MessageState.FINISH,
+                  item_list: [{ type: MessageItemType.TEXT, text_item: { text } }],
+                },
               },
-            },
-          });
-          console.log(`[progress] Sent to ${userId}: ${text}`);
-        } catch (err) {
-          console.error(`[progress] Failed to send progress:`, err);
-        }
-      },
-    };
+            });
+          } catch (err) {
+            console.error(`[progress] Failed to send progress:`, err);
+          }
+        },
+      };
 
     this.active.set(userId, handler);
     console.log(`[progress] Started monitoring for user ${userId}, session ${sessionId}`);
 
     if (!this.abortController) {
       this.abortController = new AbortController();
+      this.sseReady = new Promise((resolve) => {
+        this.sseReadyResolver = resolve;
+      });
       this.startSSEStream(this.abortController.signal).catch((err) => {
         console.error("[progress] SSE stream error:", err);
       });
     }
+
+    await this.sseReady;
   }
 
   stop(userId: string): void {
@@ -129,6 +135,9 @@ export class ProgressMonitor {
         throw new Error(`SSE connection failed: ${response.status}`);
       }
 
+      console.log("[progress] SSE connection established");
+      this.sseReadyResolver?.();
+
       const reader = response.body?.getReader();
       if (!reader) {
         throw new Error("No response body");
@@ -149,7 +158,7 @@ export class ProgressMonitor {
           if (line.startsWith("data: ")) {
             const data = line.slice(6).trim();
             if (data === "" || data === "[DONE]") continue;
-            
+
             try {
               const event = JSON.parse(data) as OpenCodeEvent;
               await this.handleEvent(event);
@@ -162,6 +171,7 @@ export class ProgressMonitor {
     } catch (err) {
       if (!abortSignal.aborted) {
         console.error("[progress] SSE stream error:", err);
+        this.sseReadyResolver?.();
       }
     } finally {
       console.log("[progress] SSE stream closed");
@@ -171,7 +181,9 @@ export class ProgressMonitor {
   private async handleEvent(event: OpenCodeEvent): Promise<void> {
     const { type, properties } = event;
 
-    if (!properties?.sessionID) return;
+    if (!properties?.sessionID) {
+      return;
+    }
 
     const userId = this.findUserBySession(properties.sessionID);
     if (!userId) return;
@@ -180,6 +192,7 @@ export class ProgressMonitor {
     if (!handler) return;
 
     let progressText = "";
+    let shouldSend = true;
 
     switch (type) {
       case "session.status":
@@ -187,9 +200,27 @@ export class ProgressMonitor {
         if (status?.type === "busy") {
           progressText = "开始处理...";
         } else if (status?.type === "idle") {
-          progressText = "处理完成";
+          progressText = "✓ 处理完成";
         } else if (status?.type === "retry") {
           progressText = `重试中 (${status.attempt}次)...`;
+        }
+        break;
+
+      case "session.idle":
+        progressText = "✓ 处理完成";
+        break;
+
+      case "session.diff":
+        const diff = properties.diff;
+        if (diff && diff.length > 0) {
+          progressText = `✓ 修改了 ${diff.length} 个文件`;
+        }
+        break;
+
+      case "message.part.delta":
+        if (properties.field === "text" && properties.delta) {
+          progressText = "💬 生成回复中...";
+          shouldSend = false;
         }
         break;
 
@@ -199,17 +230,16 @@ export class ProgressMonitor {
 
         switch (part.type) {
           case "reasoning":
-            if (part.text) {
-              progressText = `思考中...`;
-            }
+            progressText = "🤔 思考中...";
+            shouldSend = false;
             break;
 
           case "tool":
             if (part.tool && part.state) {
               if (part.state.status === "pending") {
-                progressText = `准备执行: ${part.tool}`;
+                progressText = `⏳ 准备: ${part.tool}`;
               } else if (part.state.status === "running") {
-                progressText = `执行中: ${part.tool}...`;
+                progressText = `⚙️ 执行: ${part.tool}...`;
               } else if (part.state.status === "completed") {
                 progressText = `✓ ${part.tool} 完成`;
               } else if (part.state.status === "error") {
@@ -219,27 +249,28 @@ export class ProgressMonitor {
             break;
 
           case "step-start":
-            progressText = "开始工作步骤...";
+            progressText = "▶️ 开始工作...";
             break;
 
           case "step-finish":
-            progressText = "工作步骤完成";
+            progressText = "✓ 步骤完成";
             break;
 
           case "text":
             if (part.text && part.text.length > 0) {
-              progressText = "生成回复中...";
+              progressText = "💬 生成回复中...";
+              shouldSend = false;
             }
             break;
 
           case "patch":
             if (properties.files?.length > 0) {
-              progressText = `修改 ${properties.files.length} 个文件...`;
+              progressText = `📝 修改 ${properties.files.length} 个文件...`;
             }
             break;
 
           case "error":
-            progressText = `⚠️ 发生错误`;
+            progressText = "⚠️ 发生错误";
             break;
         }
         break;
@@ -247,12 +278,12 @@ export class ProgressMonitor {
       case "session.message":
         const msg = properties;
         if (msg?.role === "assistant") {
-          progressText = "收到AI回复";
+          progressText = "💬 收到AI回复";
         }
         break;
     }
 
-    if (progressText) {
+    if (progressText && shouldSend) {
       await handler.sendProgress(progressText);
     }
   }
@@ -269,6 +300,8 @@ export class ProgressMonitor {
     this.abortController = undefined;
     this.active.clear();
     this.lastProgressTime.clear();
+    this.sseReady = Promise.resolve();
+    this.sseReadyResolver = undefined;
     console.log("[progress] Shutdown complete");
   }
 }

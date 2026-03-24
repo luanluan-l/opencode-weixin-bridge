@@ -1,0 +1,24 @@
+{
+  "name": "opencode-weixin-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Bridge opencode to WeChat via ilink bot protocol",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "npx tsx src/index.ts",
+    "build": "npx tsc",
+    "start": "node dist/index.js",
+    "login": "npx tsx src/index.ts --login"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.8.0"
+  }
+}

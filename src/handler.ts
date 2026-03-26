@@ -178,6 +178,125 @@ function isCommand(text: string): boolean {
   return text.trim().startsWith("/");
 }
 
+function extractProjectPath(text: string): string | null {
+  const patterns = [
+    /(?:切换|switch|change)[到到]?[项目project]*[:\s]*([~\.\-\w\/\\]+)/i,
+    /(?:切换|switch|change)[到到]?[项目project]*[:\s]*['"]([^'"]+)['"]/i,
+    /(?:帮我|请|帮我)[切换switch][到到]?[项目project]*[:\s]*([~\.\-\w\/\\]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match && match[1]) {
+      return match[1].trim();
+    }
+  }
+
+  const pathMatch = text.match(/[~\.\-\w\/\\]+(?:\/|\\)[~\.\-\w\/\\]+|[~\/].+|\/[\w\/\-\.\~]+/);
+  if (pathMatch) {
+    return pathMatch[0].trim();
+  }
+
+  return null;
+}
+
+async function handleSwitchProject(
+  text: string,
+  fromUserId: string,
+  creds: BotCredentials,
+  ocConfig: OpenCodeConfig,
+): Promise<boolean> {
+  const projectPath = extractProjectPath(text);
+
+  if (!projectPath) {
+    await sendMessage({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: fromUserId,
+          client_id: generateClientId(),
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [{ type: MessageItemType.TEXT, text_item: { text: "请提供项目路径，例如：\n切换到 /path/to/project\n或\n切换到 ~/Documents/my-project" } }],
+        },
+      },
+    });
+    return true;
+  }
+
+  let resolvedPath = projectPath;
+  if (!path.isAbsolute(projectPath)) {
+    resolvedPath = path.resolve(process.cwd(), projectPath);
+  }
+
+  if (!fs.existsSync(resolvedPath)) {
+    await sendMessage({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: fromUserId,
+          client_id: generateClientId(),
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [{ type: MessageItemType.TEXT, text_item: { text: `项目目录不存在: ${resolvedPath}` } }],
+        },
+      },
+    });
+    return true;
+  }
+
+  try {
+    await sendTyping({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        ilink_user_id: fromUserId,
+        typing_ticket: "",
+        status: TypingStatus.TYPING,
+      },
+    });
+
+    const newPath = await restartOpenCodeServer(resolvedPath, ocConfig.serverUrl, ocConfig.password ?? "");
+
+    await sendMessage({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: fromUserId,
+          client_id: generateClientId(),
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [{ type: MessageItemType.TEXT, text_item: { text: `✓ 已切换到项目: ${newPath}\n✓ 所有用户会话已清空` } }],
+        },
+      },
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    await sendMessage({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: fromUserId,
+          client_id: generateClientId(),
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [{ type: MessageItemType.TEXT, text_item: { text: `切换项目失败: ${errMsg}` } }],
+        },
+      },
+    });
+  }
+
+  return true;
+}
+
 async function handleCommand(
   text: string,
   fromUserId: string,
@@ -187,94 +306,7 @@ async function handleCommand(
   const trimmed = text.trim();
 
   if (trimmed.startsWith("/switch ")) {
-    const projectPath = trimmed.slice(8).trim();
-    if (!projectPath) {
-      await sendMessage({
-        baseUrl: creds.baseUrl,
-        token: creds.token,
-        body: {
-          msg: {
-            from_user_id: "",
-            to_user_id: fromUserId,
-            client_id: generateClientId(),
-            message_type: MessageType.BOT,
-            message_state: MessageState.FINISH,
-            item_list: [{ type: MessageItemType.TEXT, text_item: { text: "Usage: /switch <project-path>" } }],
-          },
-        },
-      });
-      return true;
-    }
-
-    let resolvedPath = projectPath;
-    if (!path.isAbsolute(projectPath)) {
-      resolvedPath = path.resolve(process.cwd(), projectPath);
-    }
-
-    if (!fs.existsSync(resolvedPath)) {
-      await sendMessage({
-        baseUrl: creds.baseUrl,
-        token: creds.token,
-        body: {
-          msg: {
-            from_user_id: "",
-            to_user_id: fromUserId,
-            client_id: generateClientId(),
-            message_type: MessageType.BOT,
-            message_state: MessageState.FINISH,
-            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `Project directory not found: ${resolvedPath}` } }],
-          },
-        },
-      });
-      return true;
-    }
-
-    try {
-      await sendTyping({
-        baseUrl: creds.baseUrl,
-        token: creds.token,
-        body: {
-          ilink_user_id: fromUserId,
-          typing_ticket: "",
-          status: TypingStatus.TYPING,
-        },
-      });
-
-      const newPath = await restartOpenCodeServer(resolvedPath, ocConfig.serverUrl, ocConfig.password ?? "");
-
-      await sendMessage({
-        baseUrl: creds.baseUrl,
-        token: creds.token,
-        body: {
-          msg: {
-            from_user_id: "",
-            to_user_id: fromUserId,
-            client_id: generateClientId(),
-            message_type: MessageType.BOT,
-            message_state: MessageState.FINISH,
-            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `✓ Switched to project: ${newPath}\n✓ All user sessions have been cleared` } }],
-          },
-        },
-      });
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      await sendMessage({
-        baseUrl: creds.baseUrl,
-        token: creds.token,
-        body: {
-          msg: {
-            from_user_id: "",
-            to_user_id: fromUserId,
-            client_id: generateClientId(),
-            message_type: MessageType.BOT,
-            message_state: MessageState.FINISH,
-            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `Failed to switch project: ${errMsg}` } }],
-          },
-        },
-      });
-    }
-
-    return true;
+    return await handleSwitchProject(text, fromUserId, creds, ocConfig);
   }
 
   if (trimmed === "/help" || trimmed === "/?") {
@@ -291,9 +323,12 @@ async function handleCommand(
           item_list: [{
             type: MessageItemType.TEXT,
             text_item: {
-              text: "Available commands:\n" +
-              "/switch <path> - Switch to a different project directory\n" +
-              "/help - Show this help message"
+              text: "可用指令:\n" +
+              "/switch <路径> - 切换到指定项目目录\n" +
+              "/help - 显示帮助信息\n\n" +
+              "也可以用自然语言，例如：\n" +
+              "切换到 /path/to/project\n" +
+              "帮我切换到 ~/Documents/my-project"
             }
           }],
         },
@@ -319,6 +354,20 @@ export async function handleIncomingMessage(
   if (isCommand(text)) {
     const handled = await handleCommand(text, fromUserId, creds, ocConfig);
     if (handled) return;
+  }
+
+  const switchPatterns = [
+    /切换[到到]?[项目project]?/i,
+    /switch\s*(to)?\s*project?/i,
+    /change\s*(to)?\s*project?/i,
+    /帮我[切换switch][到到]?[项目project]?/i,
+  ];
+
+  for (const pattern of switchPatterns) {
+    if (pattern.test(text)) {
+      const handled = await handleSwitchProject(text, fromUserId, creds, ocConfig);
+      if (handled) return;
+    }
   }
 
   try {

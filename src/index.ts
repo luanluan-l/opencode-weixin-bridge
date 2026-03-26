@@ -3,6 +3,7 @@ import { startMonitor } from "./monitor.js";
 import { handleIncomingMessage, type OpenCodeConfig, userSessions } from "./handler.js";
 import { DEFAULT_BASE_URL } from "./api.js";
 import { getProgressMonitor } from "./progress.js";
+import type { ChildProcess } from "node:child_process";
 
 function parseArgs(): {
   login: boolean;
@@ -157,11 +158,14 @@ async function viewSessionDetails(sessionId: string, serverUrl: string, password
   }
 }
 
+let openCodeServerChild: ChildProcess | null = null;
+let currentProjectDir: string = "";
+
 async function ensureOpenCodeServer(
   serverUrl: string,
   projectDir: string,
   password: string,
-): Promise<void> {
+): Promise<ChildProcess | null> {
   try {
     const headers: Record<string, string> = {};
     if (password) {
@@ -170,7 +174,7 @@ async function ensureOpenCodeServer(
     const res = await fetch(`${serverUrl}/global/health`, { headers, signal: AbortSignal.timeout(3000) });
     if (res.ok) {
       console.log(`[main] OpenCode server already running at ${serverUrl}`);
-      return;
+      return null;
     }
   } catch {
     // server not running
@@ -213,7 +217,8 @@ async function ensureOpenCodeServer(
       const res = await fetch(`${serverUrl}/global/health`, { headers, signal: AbortSignal.timeout(2000) });
       if (res.ok) {
         console.log(`[main] OpenCode server ready at ${serverUrl}`);
-        return;
+        currentProjectDir = projectDir;
+        return child;
       }
     } catch {
       // retry
@@ -222,6 +227,22 @@ async function ensureOpenCodeServer(
 
   console.error("[main] OpenCode server failed to start within 30s");
   process.exit(1);
+  return null;
+}
+
+export async function restartOpenCodeServer(newProjectDir: string, serverUrl: string, password: string): Promise<string> {
+  if (openCodeServerChild) {
+    console.log(`[main] Stopping OpenCode server in ${currentProjectDir}...`);
+    openCodeServerChild.kill("SIGTERM");
+    openCodeServerChild = null;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+
+  userSessions.clear();
+  console.log(`[main] Cleared all user sessions`);
+
+  openCodeServerChild = await ensureOpenCodeServer(serverUrl, newProjectDir, password);
+  return currentProjectDir;
 }
 
 async function main(): Promise<void> {
@@ -262,7 +283,7 @@ async function main(): Promise<void> {
     password: flags.ocPassword || undefined,
   };
 
-  await ensureOpenCodeServer(ocConfig.serverUrl, flags.ocProjectDir, ocConfig.password ?? "");
+  openCodeServerChild = await ensureOpenCodeServer(ocConfig.serverUrl, flags.ocProjectDir, ocConfig.password ?? "");
 
   console.log(`[main] Bot starting: accountId=${creds.accountId} opencode=${ocConfig.serverUrl} dir=${flags.ocProjectDir}`);
 
@@ -270,12 +291,18 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => {
     console.log("\n[main] SIGINT received, shutting down...");
     abortController.abort();
+    if (openCodeServerChild) {
+      openCodeServerChild.kill("SIGTERM");
+    }
     const progressMonitor = getProgressMonitor({ serverUrl: ocConfig.serverUrl, password: ocConfig.password });
     progressMonitor.shutdown();
   });
   process.on("SIGTERM", () => {
     console.log("\n[main] SIGTERM received, shutting down...");
     abortController.abort();
+    if (openCodeServerChild) {
+      openCodeServerChild.kill("SIGTERM");
+    }
     const progressMonitor = getProgressMonitor({ serverUrl: ocConfig.serverUrl, password: ocConfig.password });
     progressMonitor.shutdown();
   });

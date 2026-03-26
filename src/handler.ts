@@ -3,6 +3,9 @@ import { sendMessage, sendTyping } from "./api.js";
 import type { BotCredentials, WeixinMessage } from "./types.js";
 import { MessageItemType, MessageState, MessageType, TypingStatus } from "./types.js";
 import { getProgressMonitor } from "./progress.js";
+import { restartOpenCodeServer } from "./index.js";
+import path from "node:path";
+import fs from "node:fs";
 
 function generateClientId(): string {
   return `oc-${crypto.randomBytes(8).toString("hex")}`;
@@ -53,6 +56,7 @@ export const userSessions = new Map<string, string>();
 
 async function getOrCreateSession(userId: string, config: OpenCodeConfig): Promise<string> {
   const existing = userSessions.get(userId);
+  console.log(`[handler] getOrCreateSession: userId=${userId}, existing=${existing || "none"}, total sessions=${userSessions.size}`);
   if (existing) return existing;
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -73,6 +77,7 @@ async function getOrCreateSession(userId: string, config: OpenCodeConfig): Promi
 
   const session = (await res.json()) as { id: string };
   userSessions.set(userId, session.id);
+  console.log(`[handler] Created new session: ${userId} -> ${session.id}`);
   return session.id;
 }
 
@@ -86,37 +91,218 @@ async function callOpenCode(
     headers.Authorization = `Basic ${Buffer.from(`opencode:${config.password}`).toString("base64")}`;
   }
 
-  const res = await fetch(`${config.serverUrl}/session/${sessionId}/message`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      parts: [{ type: "text", text }],
-    }),
-  });
+  console.log(`[handler] Calling OpenCode API: ${config.serverUrl}/session/${sessionId}/message`);
+  console.log(`[handler] Request text: ${text}`);
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenCode API error ${res.status}: ${err}`);
-  }
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    console.error(`[handler] OpenCode API timeout after 120 seconds`);
+    abortController.abort();
+  }, 120000);
 
-  const data = await res.json() as Record<string, unknown>;
+  try {
+    const res = await fetch(`${config.serverUrl}/session/${sessionId}/message`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        parts: [{ type: "text", text }],
+      }),
+      signal: abortController.signal,
+    });
 
-  const parts = (data.parts ?? []) as Array<Record<string, unknown>>;
-  const textParts: string[] = [];
-  for (const part of parts) {
-    const pType = part.type as string;
-    if (pType === "text" && part.text) {
-      textParts.push(String(part.text));
-    } else if (part.content) {
-      textParts.push(String(part.content));
-    } else if (part.output) {
-      textParts.push(String(part.output));
-    } else if (part.result) {
-      textParts.push(String(part.result));
+    clearTimeout(timeoutId);
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenCode API error ${res.status}: ${err}`);
     }
+
+    const data = await res.json() as Record<string, unknown>;
+    const info = data.info as { role?: string; parentID?: string } | undefined;
+    console.log(`[handler] OpenCode response info: role=${info?.role}, parentID=${info?.parentID}`);
+
+    const parts = (data.parts ?? []) as Array<Record<string, unknown>>;
+    console.log(`[handler] OpenCode response has ${parts.length} parts`);
+    const textParts: string[] = [];
+    for (const part of parts) {
+      const pType = part.type as string;
+      console.log(`[handler] Part type: ${pType}, has text: ${!!part.text}, has content: ${!!part.content}`);
+
+      switch (pType) {
+        case "text":
+          if (part.text) {
+            textParts.push(String(part.text));
+          }
+          break;
+
+        case "reasoning":
+          console.log(`[handler] Skipping reasoning part content`);
+          break;
+
+        case "step-start":
+        case "step-finish":
+        case "tool":
+        case "error":
+          console.log(`[handler] Skipping ${pType} part`);
+          break;
+
+        default:
+          if (part.content) {
+            console.log(`[handler] Including content from part type ${pType}`);
+            textParts.push(String(part.content));
+          }
+          if (part.output) {
+            textParts.push(String(part.output));
+          }
+          if (part.result) {
+            textParts.push(String(part.result));
+          }
+      }
+    }
+
+    const finalText = textParts.join("\n").trim();
+    console.log(`[handler] Final reply (${textParts.length} text parts, ${finalText.length} chars): ${finalText.slice(0, 100)}...`);
+    return finalText || "(empty response)";
+  } catch (error: unknown) {
+    clearTimeout(timeoutId);
+
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`OpenCode API timeout (120s): ${text.slice(0, 50)}...`);
+    }
+
+    throw error;
+  }
+}
+
+function isCommand(text: string): boolean {
+  return text.trim().startsWith("/");
+}
+
+async function handleCommand(
+  text: string,
+  fromUserId: string,
+  creds: BotCredentials,
+  ocConfig: OpenCodeConfig,
+): Promise<boolean> {
+  const trimmed = text.trim();
+
+  if (trimmed.startsWith("/switch ")) {
+    const projectPath = trimmed.slice(8).trim();
+    if (!projectPath) {
+      await sendMessage({
+        baseUrl: creds.baseUrl,
+        token: creds.token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: fromUserId,
+            client_id: generateClientId(),
+            message_type: MessageType.BOT,
+            message_state: MessageState.FINISH,
+            item_list: [{ type: MessageItemType.TEXT, text_item: { text: "Usage: /switch <project-path>" } }],
+          },
+        },
+      });
+      return true;
+    }
+
+    let resolvedPath = projectPath;
+    if (!path.isAbsolute(projectPath)) {
+      resolvedPath = path.resolve(process.cwd(), projectPath);
+    }
+
+    if (!fs.existsSync(resolvedPath)) {
+      await sendMessage({
+        baseUrl: creds.baseUrl,
+        token: creds.token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: fromUserId,
+            client_id: generateClientId(),
+            message_type: MessageType.BOT,
+            message_state: MessageState.FINISH,
+            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `Project directory not found: ${resolvedPath}` } }],
+          },
+        },
+      });
+      return true;
+    }
+
+    try {
+      await sendTyping({
+        baseUrl: creds.baseUrl,
+        token: creds.token,
+        body: {
+          ilink_user_id: fromUserId,
+          typing_ticket: "",
+          status: TypingStatus.TYPING,
+        },
+      });
+
+      const newPath = await restartOpenCodeServer(resolvedPath, ocConfig.serverUrl, ocConfig.password ?? "");
+
+      await sendMessage({
+        baseUrl: creds.baseUrl,
+        token: creds.token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: fromUserId,
+            client_id: generateClientId(),
+            message_type: MessageType.BOT,
+            message_state: MessageState.FINISH,
+            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `✓ Switched to project: ${newPath}\n✓ All user sessions have been cleared` } }],
+          },
+        },
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await sendMessage({
+        baseUrl: creds.baseUrl,
+        token: creds.token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: fromUserId,
+            client_id: generateClientId(),
+            message_type: MessageType.BOT,
+            message_state: MessageState.FINISH,
+            item_list: [{ type: MessageItemType.TEXT, text_item: { text: `Failed to switch project: ${errMsg}` } }],
+          },
+        },
+      });
+    }
+
+    return true;
   }
 
-  return textParts.join("\n") || "(empty response)";
+  if (trimmed === "/help" || trimmed === "/?") {
+    await sendMessage({
+      baseUrl: creds.baseUrl,
+      token: creds.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: fromUserId,
+          client_id: generateClientId(),
+          message_type: MessageType.BOT,
+          message_state: MessageState.FINISH,
+          item_list: [{
+            type: MessageItemType.TEXT,
+            text_item: {
+              text: "Available commands:\n" +
+              "/switch <path> - Switch to a different project directory\n" +
+              "/help - Show this help message"
+            }
+          }],
+        },
+      },
+    });
+    return true;
+  }
+
+  return false;
 }
 
 export async function handleIncomingMessage(
@@ -129,6 +315,11 @@ export async function handleIncomingMessage(
   const text = extractText(msg);
 
   if (!text.trim()) return;
+
+  if (isCommand(text)) {
+    const handled = await handleCommand(text, fromUserId, creds, ocConfig);
+    if (handled) return;
+  }
 
   try {
     await sendTyping({
@@ -159,9 +350,12 @@ export async function handleIncomingMessage(
   progressMonitor.stop(fromUserId);
 
   const plainText = stripMarkdown(reply);
+  console.log(`[handler] OpenCode reply length: ${plainText.length} chars, preview: ${plainText.slice(0, 100)}`);
   const chunks = splitMessage(plainText, 4000);
+  console.log(`[handler] Sending ${chunks.length} chunk(s) to user ${fromUserId}`);
 
   for (const chunk of chunks) {
+    console.log(`[handler] Sending chunk ${chunks.length > 1 ? `(${chunks.indexOf(chunk) + 1}/${chunks.length})` : ""}: ${chunk.slice(0, 50)}...`);
     await sendMessage({
       baseUrl: creds.baseUrl,
       token: creds.token,

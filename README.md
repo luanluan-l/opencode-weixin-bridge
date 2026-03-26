@@ -53,6 +53,15 @@ Or use command-line arguments:
 npm run dev -- --api-key sk-xxx --model gpt-4o
 ```
 
+### Switch Projects via WeChat
+
+You can switch to a different project directory directly from WeChat:
+
+- `/switch /path/to/project` - Switch to the specified project directory
+- `/help` - Show available commands
+
+When you switch projects, all user sessions will be cleared and users will be mapped to new sessions in the new project.
+
 ### Configuration
 
 You can configure the bot using environment variables or command-line arguments:
